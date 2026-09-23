@@ -43,6 +43,40 @@ jobs:
       - name: Build
         run: dotnet build .\src\DeskBox\DeskBox.csproj --configuration Release --no-restore -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -v:minimal
 
+      # Publish into a dedicated directory instead of reusing the build output.
+      #
+      # The Test step below passes -p:WindowsAppSdkBootstrapInitialize=false.
+      # MSBuild global properties propagate through ProjectReference into
+      # DeskBox.csproj, so the test run recompiles DeskBox.dll without the
+      # Windows App Runtime bootstrap and overwrites the copy under bin\.
+      # Uploading bin\ therefore shipped a binary that could never start:
+      # Microsoft.UI.Xaml.Application activation failed with
+      # REGDB_E_CLASSNOTREG (0x80040154) because nothing had loaded the
+      # Windows App Runtime. Publishing to artifacts\ keeps the payload out of
+      # reach of later global-property builds.
+      - name: Publish unpackaged x64
+        run: dotnet publish .\src\DeskBox\DeskBox.csproj --configuration Release --no-restore -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:SelfContained=false -p:WindowsAppSDKSelfContained=false -o .\artifacts\publish\DeskBox\x64 -v:minimal
+
+      # An unpackaged WinUI app can only activate Microsoft.UI.Xaml.Application
+      # after the generated bootstrap code has pulled in the Windows App Runtime.
+      # Fail here rather than ship a binary that dies instantly on a user machine.
+      - name: Verify Windows App Runtime bootstrap is compiled in
+        shell: pwsh
+        run: |
+          $dll = "artifacts\publish\DeskBox\x64\DeskBox.dll"
+          if (-not (Test-Path $dll)) {
+            Write-Host "DeskBox.dll not found at $dll"
+            exit 1
+          }
+          $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($dll))
+          if ($text -match "Microsoft\.WindowsAppRuntime\.Bootstrap" -and $text -match "DynamicDependency") {
+            Write-Host "OK: bootstrap initialization is present in DeskBox.dll"
+          } else {
+            Write-Host "MISSING: DeskBox.dll has no bootstrap initialization."
+            Write-Host "An unpackaged WinUI app without it fails at startup with REGDB_E_CLASSNOTREG (0x80040154)."
+            exit 1
+          }
+
       - name: Test
         timeout-minutes: 10
         run: dotnet test .\tests\DeskBox.Tests\DeskBox.Tests.csproj --configuration Release --no-restore -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:WindowsAppSdkBootstrapInitialize=false --blame-hang --blame-hang-timeout 5m --logger "trx;LogFileName=test-results.trx" -v:minimal
@@ -54,16 +88,16 @@ jobs:
           name: test-results
           path: tests/DeskBox.Tests/TestResults/**/*.trx
 
-      # Publishes the built app so a change can be smoke-tested without a local
-      # toolchain. The output is unpackaged (WindowsPackageType=None), so
-      # launching it still requires the Windows App Runtime on the test machine.
-      # Warns rather than fails when the path is empty, so a layout change cannot
-      # turn a green build red.
+      # Ships the published unpackaged app so a change can be smoke-tested
+      # without a local toolchain. The output is unpackaged
+      # (WindowsPackageType=None), so launching it still requires the Windows App
+      # Runtime on the test machine. Warns rather than fails when the path is
+      # empty, so a layout change cannot turn a green build red.
       - name: Upload build output
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: DeskBox-win-x64
-          path: src/DeskBox/bin/x64/Release/net10.0-windows10.0.22621.0/win-x64/
+          path: artifacts/publish/DeskBox/x64/
           if-no-files-found: warn
           retention-days: 14
