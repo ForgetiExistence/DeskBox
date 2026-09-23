@@ -53,3 +53,17 @@ jobs:
         with:
           name: test-results
           path: tests/DeskBox.Tests/TestResults/**/*.trx
+
+      # Publishes the built app so a change can be smoke-tested without a local
+      # toolchain. The output is unpackaged (WindowsPackageType=None), so
+      # launching it still requires the Windows App Runtime on the test machine.
+      # Warns rather than fails when the path is empty, so a layout change cannot
+      # turn a green build red.
+      - name: Upload build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskBox-win-x64
+          path: src/DeskBox/bin/x64/Release/net10.0-windows10.0.22621.0/win-x64/
+          if-no-files-found: warn
+          retention-days: 14
