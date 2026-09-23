@@ -287,7 +287,7 @@ public partial class WidgetViewModel
 
         using var perfScope = PerformanceLogger.Measure(
             "WidgetViewModel.OnFolderChanged",
-            $"id={Config.Id} changes={changeBatch.Changes.Count} fullReload={changeBatch.RequiresFullReload}");
+            $"id={Config.Id} changes={changeBatch.Changes.Count} fullReload={changeBatch.RequiresFullReload} blind={changeBatch.BlindReloadRequested}");
 
         await _folderRefreshGate.WaitAsync();
         try
@@ -418,7 +418,19 @@ public partial class WidgetViewModel
 
     private bool ShouldUseFullReload(FolderChangeBatch changeBatch, string mappedFolderPath)
     {
-        if (changeBatch.RequiresFullReload || changeBatch.Changes.Count == 0 || changeBatch.Changes.Count > IncrementalRefreshBatchThreshold)
+        // An empty batch stays a full reload even when a blind request is behind
+        // it: the snapshot reconcile can only apply *described* changes, so with
+        // nothing attached it would enumerate the folder and then do nothing —
+        // silently losing whatever the blind source saw. A rebuild is the only
+        // honest answer there.
+        //
+        // The win is in the case this used to give away: when the index channel
+        // fires alongside a change the native watcher did describe, the batch now
+        // carries those details and no longer trips RequiresFullReload, so the
+        // reconcile applies them directly instead of tearing down the list.
+        if (changeBatch.RequiresFullReload ||
+            changeBatch.Changes.Count == 0 ||
+            changeBatch.Changes.Count > IncrementalRefreshBatchThreshold)
         {
             return true;
         }

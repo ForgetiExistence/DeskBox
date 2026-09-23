@@ -98,6 +98,7 @@ public partial class App : Application
     private DisplayTopologyTransitionCoordinator? _displayTopologyTransitionCoordinator;
     private AppLifecycleRecoveryWatcher? _lifecycleRecoveryWatcher;
     private HookHealthWatchdog? _hookHealthWatchdog;
+    private bool _workingSetTrimGateInstalled;
     private EverythingSearchService? _everythingSearchService;
     private SearchEngineService? _searchEngineService;
     private FileMetaService? _fileMetaService;
@@ -1488,6 +1489,21 @@ public partial class App : Application
                 _hookHealthWatchdog?.Dispose();
                 _hookHealthWatchdog = null;
             }
+        }
+
+        // A low-level hook callback executes inside the OS input path, so a page
+        // fault taken there stalls every application on the machine, not just this
+        // one. Working-set trimming is therefore a system-wide responsiveness
+        // lever, and it must not fire while any such hook is live. Registering the
+        // probe is independent of the watchdog above: the hooks can be healthy and
+        // still be exactly the thing that makes trimming unsafe.
+        if (!_workingSetTrimGateInstalled)
+        {
+            _workingSetTrimGateInstalled = true;
+            Win32Helper.RegisterLowLevelHookProbe(
+                () => DesktopDoubleClickActivationService?.IsActive == true
+                    || GlobalHotkeyService?.UsesReservedHook == true
+                    || _searchHotkeyService?.UsesReservedHook == true);
         }
     }
 

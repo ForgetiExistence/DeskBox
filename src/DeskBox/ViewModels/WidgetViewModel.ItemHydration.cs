@@ -243,12 +243,22 @@ public partial class WidgetViewModel
             }
         }
 
+        // Items.IndexOf is O(n) and used to sit inside this loop, making the whole
+        // method O(n²): on a desktop holding a few thousand entries that is
+        // millions of comparisons on the UI thread for every refresh, and the
+        // index channel triggers a refresh on every shell invalidation. Track
+        // positions in a dictionary instead, and repair only the tail that a
+        // structural change actually shifted. In steady state — data-only updates
+        // with no reorder, which is the common case — this is a single O(n) pass.
+        Dictionary<WidgetItem, int> positionsByItem = BuildPositionIndex(Items);
+
         for (int targetIndex = 0; targetIndex < refreshedItems.Count; targetIndex++)
         {
             var refreshedItem = refreshedItems[targetIndex];
             if (!existingByPath.TryGetValue(refreshedItem.Path, out var existingItem))
             {
                 Items.Insert(targetIndex, refreshedItem);
+                ReindexPositions(positionsByItem, Items, targetIndex);
                 continue;
             }
 
@@ -256,18 +266,57 @@ public partial class WidgetViewModel
                 existingItem,
                 refreshedItem,
                 preserveExistingIconWhenMissing: true);
-            int currentIndex = Items.IndexOf(existingItem);
-            if (currentIndex < 0)
+
+            if (!positionsByItem.TryGetValue(existingItem, out int currentIndex))
             {
+                // Defensive: existingItem came out of Items and its path is in
+                // refreshedPaths, so the prune above cannot have dropped it. Keep
+                // the insert path rather than trusting that invariant blindly.
                 Items.Insert(targetIndex, existingItem);
+                ReindexPositions(positionsByItem, Items, targetIndex);
             }
             else if (currentIndex != targetIndex)
             {
                 Items.Move(currentIndex, targetIndex);
+                ReindexPositions(positionsByItem, Items, Math.Min(currentIndex, targetIndex));
             }
         }
 
         NormalizeSortOrder();
+    }
+
+    /// <summary>
+    /// Builds a position index for <paramref name="items"/>, keyed by identity.
+    /// WidgetItem does not override Equals, so the default comparer is reference
+    /// equality — the same relation the collection's IndexOf used. If WidgetItem
+    /// ever gains value equality, this index must switch to an explicit reference
+    /// comparer to stay correct.
+    /// </summary>
+    private static Dictionary<WidgetItem, int> BuildPositionIndex(IList<WidgetItem> items)
+    {
+        var positions = new Dictionary<WidgetItem, int>(items.Count);
+        for (int index = 0; index < items.Count; index++)
+        {
+            positions[items[index]] = index;
+        }
+
+        return positions;
+    }
+
+    /// <summary>
+    /// Rewrites the position index from <paramref name="startIndex"/> to the end
+    /// of the list. A structural change only shifts that tail, so repairing it
+    /// from the change point keeps an append near the end O(1) instead of O(n).
+    /// </summary>
+    private static void ReindexPositions(
+        Dictionary<WidgetItem, int> positions,
+        IList<WidgetItem> items,
+        int startIndex)
+    {
+        for (int index = startIndex; index < items.Count; index++)
+        {
+            positions[items[index]] = index;
+        }
     }
 
     private void ApplyReconciledManualOrder(IReadOnlyList<WidgetItem> reconciled)
@@ -281,17 +330,21 @@ public partial class WidgetViewModel
             }
         }
 
+        // Same O(n²) shape as SyncFolderItems above: an IndexOf per reconciled
+        // item. Reuse the position index rather than re-scanning the list.
+        Dictionary<WidgetItem, int> positionsByItem = BuildPositionIndex(Items);
         for (int targetIndex = 0; targetIndex < reconciled.Count; targetIndex++)
         {
             WidgetItem item = reconciled[targetIndex];
-            int currentIndex = Items.IndexOf(item);
-            if (currentIndex < 0)
+            if (!positionsByItem.TryGetValue(item, out int currentIndex))
             {
                 Items.Insert(targetIndex, item);
+                ReindexPositions(positionsByItem, Items, targetIndex);
             }
             else if (currentIndex != targetIndex)
             {
                 Items.Move(currentIndex, targetIndex);
+                ReindexPositions(positionsByItem, Items, Math.Min(currentIndex, targetIndex));
             }
         }
     }

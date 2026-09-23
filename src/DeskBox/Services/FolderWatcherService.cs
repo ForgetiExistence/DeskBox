@@ -6,10 +6,30 @@ namespace DeskBox.Services;
 
 public sealed record FolderChange(string FullPath, WatcherChangeTypes ChangeType, string? OldFullPath = null);
 
+/// <summary>
+/// A debounced batch of folder changes.
+/// </summary>
+/// <remarks>
+/// RequiresFullReload and BlindReloadRequested both mean "we do not fully trust
+/// what we know", but they cost very different things and must not be collapsed:
+/// <list type="bullet">
+/// <item>RequiresFullReload means information was lost — the native buffer
+/// overflowed, or a reconnect invalidated every prior event. The list has to be
+/// rebuilt from scratch.</item>
+/// <item>BlindReloadRequested means a source saw activity it cannot describe.
+/// The index channel reports only "something in the folder changed", and a
+/// watcher error or a briefly missing root says even less. That is a request to
+/// re-derive the contents, which a snapshot reconcile satisfies far more cheaply
+/// than a full rebuild.</item>
+/// </list>
+/// Treating the second as the first is what made every shell invalidation
+/// rebuild the whole list.
+/// </remarks>
 public sealed record FolderChangeBatch(
     string WatchedPath,
     IReadOnlyList<FolderChange> Changes,
     bool RequiresFullReload,
+    bool BlindReloadRequested = false,
     int Generation = 0);
 
 public enum FolderWatcherHealth
@@ -75,6 +95,7 @@ public sealed class FolderWatcherService : IDisposable
     private readonly HashSet<string> _pendingIconPaths = new(StringComparer.OrdinalIgnoreCase);
     private int _pendingGeneration;
     private bool _requiresFullReload;
+    private bool _blindReloadRequested;
     private bool _legacyRestartQueued;
     private DateTimeOffset _lastLegacyRestartAtUtc = DateTimeOffset.MinValue;
     private bool _legacyErrorAnnounced;
@@ -373,9 +394,13 @@ public sealed class FolderWatcherService : IDisposable
 
         // StorageFileQueryResult.ContentsChanged does not provide details
         // about what changed — it only signals that something in the folder
-        // changed.  We treat this as a full-reload signal.
+        // changed. That is a blind signal, not a mandate to rebuild the list:
+        // the shell fires it for every invalidation (icon refresh, view
+        // settings, a file being written), so treating it as a full reload made
+        // the widget rebuild its entire item list on unrelated shell activity.
+        // The downstream snapshot reconcile covers what this cannot describe.
         _lastEventAt = DateTimeOffset.Now;
-        QueueFullReload(generation);
+        QueueFullReload(generation, blind: true);
     }
 
     /// <summary>
@@ -540,6 +565,7 @@ public sealed class FolderWatcherService : IDisposable
             _pendingIconPaths.Clear();
             _pendingGeneration = 0;
             _requiresFullReload = false;
+            _blindReloadRequested = false;
             _legacyRestartQueued = false;
             _reconnectPath = null;
             _requestedPath = null;
@@ -645,7 +671,9 @@ public sealed class FolderWatcherService : IDisposable
 
         // FileSystemWatcher callbacks run on a worker thread. Both reload and
         // reconnect paths marshal their DispatcherQueueTimer work explicitly.
-        QueueFullReload(generation);
+        // The root being gone says nothing about what changed, only that the
+        // known contents can no longer be trusted — a reconcile settles it.
+        QueueFullReload(generation, blind: true);
         BeginReconnect(path);
         return true;
     }
@@ -671,7 +699,9 @@ public sealed class FolderWatcherService : IDisposable
             App.Log($"[FolderWatcher] Watcher error: {e.GetException()}");
         }
 
-        QueueFullReload(generation);
+        // A watcher error means events were dropped, but not which ones. The
+        // restart below re-establishes the watch; the reconcile covers the gap.
+        QueueFullReload(generation, blind: true);
 
         string? path;
         lock (_lock)
@@ -887,7 +917,16 @@ public sealed class FolderWatcherService : IDisposable
         _dispatcherQueue.TryEnqueue(RestartDebounceTimer);
     }
 
-    private void QueueFullReload(int? generation = null)
+    /// <summary>
+    /// Requests a reload for <paramref name="generation"/>.
+    /// </summary>
+    /// <param name="generation">Watch generation the signal belongs to.</param>
+    /// <param name="blind">
+    /// True when the source cannot describe what changed. Such a request can be
+    /// satisfied by a snapshot reconcile; passing false asserts that information
+    /// was actually lost and only a full rebuild will do.
+    /// </param>
+    private void QueueFullReload(int? generation = null, bool blind = false)
     {
         lock (_lock)
         {
@@ -899,7 +938,14 @@ public sealed class FolderWatcherService : IDisposable
             }
 
             _pendingGeneration = effectiveGeneration;
-            _requiresFullReload = true;
+            if (blind)
+            {
+                _blindReloadRequested = true;
+            }
+            else
+            {
+                _requiresFullReload = true;
+            }
         }
 
         _dispatcherQueue.TryEnqueue(RestartDebounceTimer);
@@ -925,13 +971,21 @@ public sealed class FolderWatcherService : IDisposable
                 WatchedPath,
                 _pendingChanges.ToList(),
                 _requiresFullReload,
+                _blindReloadRequested,
                 _pendingGeneration == 0 ? _watchGeneration : _pendingGeneration);
             _pendingChanges.Clear();
             _pendingGeneration = 0;
             _requiresFullReload = false;
+            _blindReloadRequested = false;
         }
 
-        if (batch.Changes.Count == 0 && !batch.RequiresFullReload)
+        // A blind request carries no changes by definition, so it must not be
+        // filtered out here — dropping it would silently stop the index channel
+        // from ever reaching the view model, and folder changes made outside
+        // DeskBox would go unnoticed.
+        if (batch.Changes.Count == 0 &&
+            !batch.RequiresFullReload &&
+            !batch.BlindReloadRequested)
         {
             return;
         }

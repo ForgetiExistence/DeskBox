@@ -1944,6 +1944,52 @@ public static partial class Win32Helper
         IntPtr dwMaxWorkingSetSize);
 
     /// <summary>
+    /// Probes registered by low-level input hook owners, each reporting whether
+    /// its hook is installed right now. Queried rather than counted on purpose:
+    /// Windows removes a starved WH_KEYBOARD_LL/WH_MOUSE_LL hook without any
+    /// notification (LowLevelHooksTimeout), so an install/uninstall counter can
+    /// drift out of sync with reality and would keep the trim disabled forever.
+    /// </summary>
+    private static readonly object s_lowLevelHookProbeLock = new();
+    private static readonly List<Func<bool>> s_lowLevelHookProbes = [];
+
+    /// <summary>
+    /// Registers a probe answering "is a low-level input hook installed now".
+    /// </summary>
+    internal static void RegisterLowLevelHookProbe(Func<bool> isActive)
+    {
+        ArgumentNullException.ThrowIfNull(isActive);
+
+        lock (s_lowLevelHookProbeLock)
+        {
+            s_lowLevelHookProbes.Add(isActive);
+        }
+    }
+
+    private static bool AnyLowLevelHookActive()
+    {
+        lock (s_lowLevelHookProbeLock)
+        {
+            foreach (Func<bool> probe in s_lowLevelHookProbes)
+            {
+                try
+                {
+                    if (probe())
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // A probe must never make the trim path throw.
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Pages the whole working set out (same effect as minimizing a window).
     /// Historically only safe while every widget was hidden and the user was
     /// idle: touched pages fault back in afterwards, which would jitter
@@ -1955,9 +2001,21 @@ public static partial class Win32Helper
     /// transient UI, and active visual work, plus a post-trim cooldown with a
     /// regrowth gate. The immediate-hidden and visible-idle paths keep the
     /// old hidden-or-user-away contract.
+    ///
+    /// Refuses while a low-level input hook is installed. The hook callback
+    /// runs inside the system's input path, so the first click or keystroke
+    /// after a trim would pay the fault-in cost of this process's pages before
+    /// the callback could return - turning a local memory decision into a
+    /// machine-wide input stall. Returning false is safe: every caller treats
+    /// the trim as best-effort.
     /// </summary>
     public static bool TrimWorkingSet()
     {
+        if (AnyLowLevelHookActive())
+        {
+            return false;
+        }
+
         try
         {
             return SetProcessWorkingSetSize(
